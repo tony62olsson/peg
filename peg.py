@@ -1,4 +1,5 @@
 import ast
+import traceback
 import unittest
 import abc
 import re
@@ -75,12 +76,13 @@ No skip rules:
 """
 
     def __init__(self):
-        self.rules = dict()
+        names = dict()
         grammar_parser = GrammarParser()
         for name, func in self.__class__.__dict__.items():
             if name.startswith('rule_') or name.endswith('_rule'):
                 name, rule = grammar_parser.parse(func.__doc__)
-                self.rules.setdefault(name, RuleSelection()).add(rule)
+                names.setdefault(name, list()).append(rule)
+        self.rules = dict((name, RuleSelection(*rules)) for name, rules in names.items())
 
     def parse(self, goal, text):
         return self.rules.setdefault(goal, RuleSelection()).match(Context(self, text), 0)
@@ -117,10 +119,9 @@ class GrammarParser(object):
                 RuleSequence(RuleRepeat(0, None, RuleReference('sequence_word')),
                              RuleRepeat(0, 1, RuleSequence(WS, RuleString('&'),
                                                            RuleRepeat(1, None, RuleReference('sequence_word')))),
-                             action=lambda r: RuleSequence(*r[0].apply())),
+                             action=lambda r: ((lambda r0: r0[0] if len(r0) == 1 else RuleSequence(*r0))(r[0].apply()))),
             'sequence_word':
-                RuleSequence(RuleRepeat(0, 1, RuleSequence(WS, RuleString('.'))),
-                             RuleRepeat(0, 1, RuleSequence(WS, RuleString('!'))),
+                RuleSequence(RuleRepeat(0, 1, RuleSequence(WS, RuleString('!'))),
                              RuleReference('word'),
                              RuleRepeat(0, 1, RuleSequence(WS, RuleSelection(
                                  RuleString('?', action=lambda _: (0, 1)),
@@ -135,19 +136,19 @@ class GrammarParser(object):
                                               WS, RuleString('>'),
                                               action=lambda r: r[1])),
                                                            action=lambda r: r[1])),
-                             action=lambda r: r[2].result.apply()),
+                             action=lambda r: r[1].apply()),
             'word':
                 RuleSelection(RuleSequence(WS, REGEXP, action=lambda r: r[1].apply()),
                               RuleSequence(WS, STRING, action=lambda r: r[1].apply()),
                               RuleSequence(WS, WORD, action=lambda r: RuleReference(r[1].apply())),
                               RuleSequence(WS, RuleString('('), RuleReference('rule'), WS, RuleString(')'), action=lambda r: r[2].apply()),
-                              RuleSequence(WS, RuleString('{'), RuleReference('rule'), WS, RuleString('}'), action=lambda r: r[2].apply()),
-                              RuleSequence(WS, RuleString('['), RuleReference('rule'), WS, RuleString(']'), action=lambda r: r[2].apply()),
+                              RuleSequence(WS, RuleString('{'), RuleReference('rule'), WS, RuleString('}'), action=lambda r: RuleRepeat(0, None, r[2].apply())),
+                              RuleSequence(WS, RuleString('['), RuleReference('rule'), WS, RuleString(']'), action=lambda r: RuleRepeat(0, 1, r[2].apply())),
                               RuleSequence(WS, RuleString('<<'), RuleReference('rule'), WS, RuleString('>>'), action=lambda r: r[2].apply()))
 
         }
 
-    @trace
+    #@trace
     def parse(self, text, goal='statement'):
         match = self.rules[goal].match(Context(self.rules, text), 0)
         if match:
@@ -205,6 +206,32 @@ class Rule(object):
         raise NotImplemented()
 
 
+class RuleReference(Rule):
+
+    def __init__(self, name, action=None):
+        self.action = action
+        self.name = name
+
+    @memoize
+    def match(self, context, at):
+        if self.name in context.rules:
+            result = context.rules[self.name].match(context, at)
+            if result:
+                return Result(self.action, result, context.text, at, result.end)
+
+    def __eq__(self, other):
+        return type(other) == RuleReference and other.name == self.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __str__(self):
+        return self.name
+
+    def __repr__(self):
+        return "RuleReference(%s)" % self.name
+
+
 class RuleString(Rule):
 
     def __init__(self, word, action=None):
@@ -217,6 +244,12 @@ class RuleString(Rule):
         if context.text.startswith(self.word, at):
             return Result(self.action, self.word, context.text, at, at + self.length)
 
+    def __eq__(self, other):
+        return type(other) == RuleString and other.word == self.word
+
+    def __hash__(self):
+        return hash(self.word)
+
     def __str__(self):
         return repr(self.word)
 
@@ -228,7 +261,7 @@ class RuleRegexp(Rule):
 
     def __init__(self, regexp, action=None):
         self.action = action
-        self.regexp = regexp
+        self.regexp = regexp if type(regexp) == type(re.compile('')) else re.compile(str(regexp))
 
     @memoize
     def match(self, context, at):
@@ -238,6 +271,12 @@ class RuleRegexp(Rule):
         else:
             return None
 
+    def __eq__(self, other):
+        return type(other) == RuleRegexp and other.regexp == self.regexp
+
+    def __hash__(self):
+        return hash(self.regexp)
+
     def __str__(self):
         return 'r' + repr(self.regexp.pattern)
 
@@ -245,14 +284,38 @@ class RuleRegexp(Rule):
         return "RuleRegexp(%s)" % repr(self.regexp.pattern)
 
 
+class RuleSelection(Rule):
+
+    def __init__(self, *rules, action=None):
+        self.action = action
+        self.rules = rules
+
+    @memoize
+    def match(self, context, at):
+        for rule in self.rules:
+            result = rule.match(context, at)
+            if result is not None:
+                return Result(self.action, result, context.text, at, result.end)
+        return None
+
+    def __eq__(self, other):
+        return type(other) == RuleSelection and other.rules == self.rules
+
+    def __hash__(self):
+        return hash(self.rules)
+
+    def __str__(self):
+        return ' / '.join(str(r) for r in self.rules)
+
+    def __repr__(self):
+        return "RuleSelection(%s)" % ', '.join(repr(r) for r in self.rules)
+
+
 class RuleSequence(Rule):
 
     def __init__(self, *rules, action=None):
         self.action = action
-        self.rules = list(rules)
-
-    def add(self, rule):
-        self.rules.append(rule)
+        self.rules = rules
 
     @memoize
     def match(self, context, at):
@@ -266,35 +329,17 @@ class RuleSequence(Rule):
             sequence.append(result)
         return Result(self.action, sequence, context.text, at, end)
 
+    def __eq__(self, other):
+        return type(other) == RuleSequence and other.rules == self.rules
+
+    def __hash__(self):
+        return hash(self.rules)
+
     def __str__(self):
         return "(%s)" % ' '.join(str(r) for r in self.rules)
 
     def __repr__(self):
         return "RuleSequence(%s)" % ', '.join(repr(r) for r in self.rules)
-
-
-class RuleSelection(Rule):
-
-    def __init__(self, *rules, action=None):
-        self.action = action
-        self.rules = list(rules)
-
-    def add(self, rule):
-        self.rules.append(rule)
-
-    @memoize
-    def match(self, context, at):
-        for rule in self.rules:
-            result = rule.match(context, at)
-            if result is not None:
-                return Result(self.action, result, context.text, at, result.end)
-        return None
-
-    def __str__(self):
-        return ' / '.join(str(r) for r in self.rules)
-
-    def __repr__(self):
-        return "RuleSelection(%s)" % ', '.join(repr(r) for r in self.rules)
 
 
 class RuleRepeat(Rule):
@@ -322,6 +367,12 @@ class RuleRepeat(Rule):
             return None
         return Result(self.action, sequence, context.text, at, end)
 
+    def __eq__(self, other):
+        return type(other) == RuleRepeat and other.lower == self.lower and other.upper == self.upper and other.rule == self.rule
+
+    def __hash__(self):
+        return hash((self.lower, self.upper, self.rule))
+
     def __str__(self):
         if self.lower == 0 and self.upper is None:
             return "{%s}" % self.rule
@@ -335,29 +386,7 @@ class RuleRepeat(Rule):
             return "{%s}<%d,%d>" % (self.rule, self.lower, self.upper)
 
     def __repr__(self):
-        return "RuleSelection(%s, %s, %s)" % (self.lower, self.upper, repr(self.rule))
-
-
-class RuleReference(Rule):
-
-    def __init__(self, name, action=None):
-        self.action = action
-        self.name = name
-
-    def match(self, context, at):
-        if self.name in context.rules:
-            result = context.rules[self.name].match(context, at)
-            if result:
-                return Result(self.action, result, context.text, at, result.end)
-
-    def __eq__(self, other):
-        return type(other) == RuleReference and other.name == self.name
-
-    def __str__(self):
-        return self.name
-
-    def __repr__(self):
-        return "RuleReference(%s)" % self.name
+        return "RuleRepeat(%s, %s, %s)" % (self.lower, self.upper, repr(self.rule))
 
 
 class TestRule(unittest.TestCase):
@@ -418,16 +447,25 @@ class TestGrammarParser(unittest.TestCase):
 
     def test_word_rule(self):
         grammar = GrammarParser()
-        self.assertEqual(grammar.parse("hello", goal='word'), RuleReference('hello'))
-        self.assertIsNotNone(grammar.parse("'hello world'", goal='word'))
-        self.assertIsNotNone(grammar.parse("r'hello\s+world'", goal='word'))
-        self.assertIsNotNone(grammar.parse("(ws)", goal='word'))
-        self.assertIsNotNone(grammar.parse("{ws ws}", goal='word'))
-        self.assertIsNotNone(grammar.parse("[ws / ws]", goal='word'))
+        self.assertEqual(grammar.parse("hello", goal='word'),
+                         RuleReference('hello'))
+        self.assertEqual(grammar.parse("'hello world'", goal='word'),
+                         RuleString('hello world'))
+        self.assertEqual(grammar.parse("r'hello\s+world'", goal='word'),
+                         RuleRegexp(r'hello\s+world'))
+        self.assertEqual(grammar.parse("(ws)", goal='word'),
+                         RuleReference('ws'))
+        self.assertEqual(grammar.parse("{ws ws}", goal='word'),
+                         RuleRepeat(0, None, RuleSequence(RuleReference('ws'), RuleReference('ws'))))
+        self.assertEqual(grammar.parse("[ws / ws]", goal='word'),
+                         RuleRepeat(0, 1, RuleSelection(RuleReference('ws'), RuleReference('ws'))))
+        self.assertEqual(grammar.parse("<<ws>>", goal='word'),
+                         RuleReference('ws'))
 
     def test_sequence_word_rule(self):
         grammar = GrammarParser()
-        self.assertIsNotNone(grammar.parse("hello", goal='sequence_word'))
+        self.assertEqual(grammar.parse("hello", goal='sequence_word'),
+                         RuleReference('hello'))
 
 
 class TestGrammar(unittest.TestCase):
@@ -436,9 +474,6 @@ class TestGrammar(unittest.TestCase):
 
         def statement_rule(self):
             r"statement = 'hello' r'\s+' 'world'"
-
-        def ws_rule(self):
-            r"ws = r'\s+'"
 
     def test_simple_grammar(self):
         grammar = self.HelloGrammar()
