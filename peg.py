@@ -48,7 +48,7 @@ Grammar:
 * statement = name '=' rule
 * rule = sequence {'/' sequence}
 * sequence = {sequence_word} ['&' {sequence_word}+]
-* sequence_word =  ['.'] ['!'] word ['?' / '*' / '+' / '<' [lower] [',' [upper]] '>']
+* sequence_word =  ['!'] word ['?' / '*' / '+' / '<' [lower] [',' [upper]] '>']
 * word = regexp / string / name / '(' rule ')' / '{' rule '}' / '[' rule ']' / '<<' rule '>>
 
 Literals:
@@ -72,7 +72,6 @@ Repetition short-cuts:
 No skip rules:
 
 * << rule >>    is rule with no skip
-* .             is no skip
 """
 
     def __init__(self):
