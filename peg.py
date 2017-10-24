@@ -5,6 +5,7 @@ import unittest
 
 
 ########################################################################################################################
+import sys
 
 
 def memoize(f):
@@ -89,7 +90,11 @@ No skip rules:
         self.rules = dict((name, SelectionMatcher(*rules)) for name, rules in names.items())
 
     def parse(self, goal, text):
-        return self.rules.setdefault(goal, SelectionMatcher()).match(Context(self, text), 0, None)
+        result, end = ReferenceMatcher(goal).match(Context(self.rules, text), 0, RegexpMatcher(r'\s*'))
+        if result is not None and end == len(text):
+            return Matcher.apply(result, self)
+        else:
+            return None
 
 
 ########################################################################################################################
@@ -112,18 +117,18 @@ class GrammarParser(object):
 
     #@trace
     def parse(self, text, goal='statement'):
-        match = self.rules[goal].match(Context(self.rules, text), 0, RegexpMatcher(r'\s*'))
-        if match:
-            return match.apply()
+        result, end = ReferenceMatcher(goal).match(Context(self.rules, text), 0, RegexpMatcher(r'\s*'))
+        if result is not None and end == len(text):
+            return Matcher.apply(result, self)
+        else:
+            return None
 
     def _statement_matcher(self):
         # statement = word '=' rule
+        return SequenceMatcher(self.name, StringMatcher('='), ref('rule'))
 
-        def statement_action(r):
-            return r[0].apply(), r[2].apply()
-
-        return SequenceMatcher(self.name, StringMatcher('='), ref('rule'),
-                               action=statement_action)
+    def statement_rule(self, rule):
+        return rule[0].group(0), rule[2]
 
     def _rule_matcher(self):
         # rule = sequence {'/' sequence}
@@ -137,86 +142,129 @@ class GrammarParser(object):
                 return r0
 
         m0 = ref('sequence')
-        m1 = rep0(StringMatcher('/'), ref('sequence'), action=lambda r: r[1].apply())
-        return SequenceMatcher(m0, m1, action=rule_action)
+        m1 = rep0(StringMatcher('/'), ref('sequence'))
+        return SequenceMatcher(m0, m1)
+
+    def rule_visitor(self, rule):
+        m0, m1 = rule
+        if m1:
+            return SelectionMatcher(m0, *list(sequence for _, sequence in m1))
+        else:
+            return m0
 
     def _sequence_matcher(self):
         # sequence = {sequence_word} ['&' {sequence_word}+]
-
-        def sequence_action(r):
-            r0 = r[0].apply()
-            r1 = r[1].apply()
-            if len(r0) == 1:
-                return r0[0]
-            else:
-                return SequenceMatcher(*r0)
-
         m0 = rep0(ref('sequence_word'))
         m1 = opt(StringMatcher('&'), rep1(ref('sequence_word')))
-        return SequenceMatcher(m0, m1, action=sequence_action)
+        return SequenceMatcher(m0, m1)
+
+    def sequence_visitor(self, rule):
+        m0, m1 = rule
+        if len(m0) == 1:
+            result = m0[0]
+        else:
+            result = SequenceMatcher(*m0)
+        return result
 
     def _sequence_word_matcher(self):
         # sequence_word = ['!'] word ['?' | '*' | '+' | '<' times '>' | '<' [lower] ',' [upper] '>'
-
-        def sequence_word_action(r):
-            r0 = r[0].apply()
-            matcher = r[1].apply()
-            r2 = r[2].apply()
-            if r2:
-                matcher = RepeatMatcher(r2[0][0], r2[0][1], matcher)
-            if r0:
-                matcher = NotMatcher(matcher)
-            return matcher
-
         m0 = opt(StringMatcher('!'))
         m1 = ref('word')
-        m2s0 = StringMatcher('?', action=lambda _: (0, 1))
-        m2s1 = StringMatcher('*', action=lambda _: (0, None))
-        m2s2 = StringMatcher('+', action=lambda _: (1, None))
-        m2s3a = SequenceMatcher(opt(self.number), StringMatcher(','), opt(self.number),
-                               action=lambda r: ((lambda r0, r2: (r0[0] if r0 else 0, r2[0] if r2 else None))(r[0].apply(), r[2].apply())))
-        m2s3b = SequenceMatcher(self.number, action=lambda r: (r[0].apply(), r[0].apply()))
-        m2s3 = SequenceMatcher(StringMatcher('<'), SelectionMatcher(m2s3a, m2s3b), StringMatcher('>'),
-                               action=lambda r: r[1].apply())
-        m2 = opt(SelectionMatcher(m2s0, m2s1, m2s2, m2s3))
-        return SequenceMatcher(m0, m1, m2, action=sequence_word_action)
+        m2 = opt(SelectionMatcher(StringMatcher('?'),
+                                  StringMatcher('*'),
+                                  StringMatcher('+'),
+                                  SequenceMatcher(StringMatcher('<'), self.number, StringMatcher('>')),
+                                  SequenceMatcher(StringMatcher('<'), opt(self.number), StringMatcher(','), opt(self.number), StringMatcher('>'))))
+        return SequenceMatcher(m0, m1, m2)
+
+    def sequence_word_visitor(self, rule):
+        m0, m1, m2 = rule
+        if m2:
+            repeat_val = m2[0]
+            if type(repeat_val) == tuple:
+                repeat_str = repeat_val[0]
+                if repeat_str == '?':
+                    m1 = RepeatMatcher(0, 1, m1)
+                elif repeat_str == '*':
+                    m1 = RepeatMatcher(0, None, m1)
+                elif repeat_str == '+':
+                    m1 = RepeatMatcher(1, None, m1)
+            elif len(repeat_val) == 3:
+                m1 = RepeatMatcher(repeat_val[1], repeat_val[1], m1)
+            else:
+                lower_opt = repeat_val[1]
+                upper_opt = repeat_val[3]
+                lower = lower_opt[0] if lower_opt else 0
+                upper = upper_opt[0] if upper_opt else None
+                m1 = RepeatMatcher(lower, upper, m1)
+        if m0:
+            m1 = NotMatcher(m1)
+        return m1
 
     def _word_matcher(self):
+        # word = regexp / string / name / '(' rule ')' / '{' rule '}' / '[' rule ']' / '<<' rule '>>
         return SelectionMatcher(self.regexp,
                                 self.string,
-                                SequenceMatcher(self.name, action=lambda r: ref(r[0].apply())),
-                                SequenceMatcher(StringMatcher('('), ref('rule'), StringMatcher(')'), action=lambda r: r[1].apply()),
-                                SequenceMatcher(StringMatcher('{'), ref('rule'), StringMatcher('}'), action=lambda r: rep0(r[1].apply())),
-                                SequenceMatcher(StringMatcher('['), ref('rule'), StringMatcher(']'), action=lambda r: opt(r[1].apply())),
-                                SequenceMatcher(StringMatcher('<<'), ref('rule'), StringMatcher('>>'), action=lambda r: r[1].apply()))
+                                NamedMatcher('reference', self.name),
+                                NamedMatcher('group', SequenceMatcher(StringMatcher('('), ref('rule'), StringMatcher(')'))),
+                                NamedMatcher('repeat', SequenceMatcher(StringMatcher('{'), ref('rule'), StringMatcher('}'))),
+                                NamedMatcher('optional', SequenceMatcher(StringMatcher('['), ref('rule'), StringMatcher(']'))),
+                                NamedMatcher('verbatim', SequenceMatcher(StringMatcher('<<'), ref('rule'), StringMatcher('>>'))))
+
+    def word_visitor(self, word):
+        return word
+
+    def reference_visitor(self, name):
+         return ReferenceMatcher(name.group(0))
+
+    def group_visitor(self, rule):
+        return rule[1]
+
+    def repeat_visitor(self, rule):
+        return RepeatMatcher(0, None, rule[1])
+
+    def optional_visitor(self, rule):
+        return RepeatMatcher(0, 1, rule[1])
+
+    def verbatim_visitor(self, rule):
+        return VerbatimMatcher(rule[1])
 
     def _name_matcher(self):
-        return RegexpMatcher(r'\w+', action=lambda r: r.group(0))
+        return RegexpMatcher(r'\w+')
 
     def _string_matcher(self):
-        return RegexpMatcher(r"'(?:\\'|[^'])*'", action=lambda r: StringMatcher(ast.literal_eval(r.group(0))))
+        return NamedMatcher('string', RegexpMatcher(r"'(?:\\'|[^'])*'"))
+
+    def string_visitor(self, value):
+        return StringMatcher(ast.literal_eval(value.group(0)))
 
     def _regexp_matcher(self):
-        return RegexpMatcher(r"r'(?:\\'|[^'])*'", action=lambda r: RegexpMatcher(ast.literal_eval(r.group(0))))
+        return NamedMatcher('regexp', RegexpMatcher(r"r'(?:\\'|[^'])*'"))
+
+    def regexp_visitor(self, value):
+        return RegexpMatcher(ast.literal_eval(value.group(0)))
 
     def _number_matcher(self):
-        return RegexpMatcher('\d+', action=lambda r: ast.literal_eval(r.group(0)))
+        return NamedMatcher('number', RegexpMatcher(r'\d+'))
+
+    def number_visitor(self, value):
+        return ast.literal_eval(value.group(0))
 
 
-def ref(name, action=None):
-    return ReferenceMatcher(name, action=action)
+def ref(name):
+    return ReferenceMatcher(name)
 
 
-def opt(*matchers, action=None):
-    return RepeatMatcher(0, 1, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers, action=action))
+def opt(*matchers):
+    return RepeatMatcher(0, 1, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers))
 
 
-def rep0(*matchers, action=None):
-    return RepeatMatcher(0, None, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers, action=action))
+def rep0(*matchers):
+    return RepeatMatcher(0, None, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers))
 
 
-def rep1(*matchers, action=None):
-    return RepeatMatcher(1, None, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers, action=action))
+def rep1(*matchers):
+    return RepeatMatcher(1, None, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers))
 
 
 ########################################################################################################################
@@ -236,6 +284,9 @@ class Context(object):
 
 
 class Result(object):
+
+    # Result node should only be created by a ReferenceMatcher, StringMatcher and RegexpMatcher all other collapse
+    # to items or lists
 
     def __init__(self, action, result, text, start, end):
         self.action = action
@@ -271,19 +322,46 @@ class Matcher(object):
     def match(self, context, at, skip):
         raise NotImplemented()
 
+    @staticmethod
+    def _skip(context, at, skip):
+        if skip:
+            result, end = skip.match(context, at, None)
+            while result and end > at:
+                at = end
+                result, end = skip.match(context, at, None)
+        return at
+
+    @classmethod
+    def apply(cls, match, visitor):
+        if type(match) == list:
+            return list(cls.apply(item, visitor) for item in match)
+        elif type(match) == tuple and not type(match[1]) == int:
+            return cls.visit(visitor, match[0], cls.apply(match[1], visitor))
+        else:
+            return match
+
+    @classmethod
+    def visit(cls, visitor, name, args):
+        for suffix in ['_visitor', '_rule']:
+            fn_name = name + suffix
+            if fn_name in visitor.__class__.__dict__:
+                return visitor.__class__.__dict__[fn_name](visitor, args)
+        raise Exception("%s.%s do not have a '%s_visitor' or '%s_rule' method defined" %
+                        (visitor.__class__.__module__, visitor.__class__.__name__, name, name))
+
 
 class ReferenceMatcher(Matcher):
 
-    def __init__(self, name, action=None):
-        self.action = action
+    def __init__(self, name):
         self.name = name
 
     @memoize
     def match(self, context, at, skip):
         if self.name in context.rules:
-            result = context.rules[self.name].match(context, at, skip)
+            result, end = context.rules[self.name].match(context, at, skip)
             if result:
-                return Result(self.action, result, context.text, at, result.end)
+                return (self.name, result), end
+        return None, at
 
     def __eq__(self, other):
         return type(other) == ReferenceMatcher and other.name == self.name
@@ -298,22 +376,44 @@ class ReferenceMatcher(Matcher):
         return "ReferenceMatcher(%s)" % self.name
 
 
+class NamedMatcher(Matcher):
+
+    def __init__(self, name, rule):
+        self.name = name
+        self.rule = rule
+
+    @memoize
+    def match(self, context, at, skip):
+        result, end = self.rule.match(context, at, skip)
+        if result:
+            return (self.name, result), end
+        return None, at
+
+    def __eq__(self, other):
+        return type(other) == NamedMatcher and other.name == self.name and other.rule == self.rule
+
+    def __hash__(self):
+        return hash((self.name, self.rule))
+
+    def __str__(self):
+        return "%s:%s" % (self.name, self.rule)
+
+    def __repr__(self):
+        return "NamedMatcher(%s, %s)" % (self.name, repr(self.rule))
+
+
 class StringMatcher(Matcher):
 
-    def __init__(self, word, action=None):
-        self.action = action
+    def __init__(self, word):
         self.word = word
         self.length = len(word)
 
     @memoize
     def match(self, context, at, skip):
-        if skip:
-            result = skip.match(context, at, None)
-            while result and result.end > at:
-                at = result.end
-                result = skip.match(context, at, None)
+        at = self._skip(context, at, skip)
         if context.text.startswith(self.word, at):
-            return Result(self.action, self.word, context.text, at, at + self.length)
+            return (self.word, at), at + self.length
+        return None, at
 
     def __eq__(self, other):
         return type(other) == StringMatcher and other.word == self.word
@@ -330,22 +430,16 @@ class StringMatcher(Matcher):
 
 class RegexpMatcher(Matcher):
 
-    def __init__(self, regexp, action=None):
-        self.action = action
+    def __init__(self, regexp):
         self.regexp = regexp if type(regexp) == type(re.compile('')) else re.compile(str(regexp))
 
     @memoize
     def match(self, context, at, skip):
-        if skip:
-            result = skip.match(context, at, None)
-            while result and result.end > at:
-                at = result.end
-                result = skip.match(context, at, None)
+        at = self._skip(context, at, skip)
         match = self.regexp.match(context.text, at)
         if match:
-            return Result(self.action, match, context.text, at, match.end(0))
-        else:
-            return None
+            return match, match.end(0)
+        return None, at
 
     def __eq__(self, other):
         return type(other) == RegexpMatcher and other.regexp == self.regexp
@@ -362,17 +456,16 @@ class RegexpMatcher(Matcher):
 
 class SelectionMatcher(Matcher):
 
-    def __init__(self, *matchers, action=None):
-        self.action = action
+    def __init__(self, *matchers):
         self.matchers = matchers
 
     @memoize
     def match(self, context, at, skip):
         for matcher in self.matchers:
-            result = matcher.match(context, at, skip)
+            result, end = matcher.match(context, at, skip)
             if result is not None:
-                return Result(self.action, result, context.text, at, result.end)
-        return None
+                return result, end
+        return None, at
 
     def __eq__(self, other):
         return type(other) == SelectionMatcher and other.matchers == self.matchers
@@ -389,8 +482,7 @@ class SelectionMatcher(Matcher):
 
 class SequenceMatcher(Matcher):
 
-    def __init__(self, *matchers, action=None):
-        self.action = action
+    def __init__(self, *matchers):
         self.matchers = matchers
 
     @memoize
@@ -398,12 +490,12 @@ class SequenceMatcher(Matcher):
         sequence = list()
         end = at
         for matcher in self.matchers:
-            result = matcher.match(context, end, skip)
+            result, end = matcher.match(context, end, skip)
             if result is None:
-                return None
-            end = result.end
-            sequence.append(result)
-        return Result(self.action, sequence, context.text, at, end)
+                return None, at
+            if type(result) != bool:
+                sequence.append(result)
+        return sequence, end
 
     def __eq__(self, other):
         return type(other) == SequenceMatcher and other.matchers == self.matchers
@@ -420,28 +512,23 @@ class SequenceMatcher(Matcher):
 
 class RepeatMatcher(Matcher):
 
-    def __init__(self, lower, upper, matcher, action=None):
-        self.action = action
+    def __init__(self, lower, upper, matcher):
         self.lower = lower
         self.upper = upper
         self.matcher = matcher
 
     @memoize
     def match(self, context, at, skip):
-        end = at
         sequence = list()
-        count = 0
-        result = self.matcher.match(context, end, skip)
-        while result:
-            end = result.end
-            if count == self.upper:
-                return None
+        end = at
+        while self.upper is None or len(sequence) < self.upper:
+            result, end = self.matcher.match(context, end, skip)
+            if result is None:
+                break
             sequence.append(result)
-            count += 1
-            result = self.matcher.match(context, end, skip)
-        if count < self.lower:
-            return None
-        return Result(self.action, sequence, context.text, at, end)
+        if len(sequence) < self.lower:
+            return None, at
+        return sequence, end
 
     def __eq__(self, other):
         return type(other) == RepeatMatcher and other.lower == self.lower and other.upper == self.upper and other.matcher == self.matcher
@@ -467,15 +554,13 @@ class RepeatMatcher(Matcher):
 
 class LookaheadMatcher(Matcher):
 
-    def __init__(self, matcher, action=None):
-        self.action = action
+    def __init__(self, matcher):
         self.matcher = matcher
 
     @memoize
     def match(self, context, at, skip):
-        result = self.matcher.match(context, at, skip)
-        if result:
-            return Result(self.action, result, context.text, at, at)
+        result, _ = self.matcher.match(context, at, skip)
+        return result is not None or None, at
 
     def __eq__(self, other):
         return type(other) == LookaheadMatcher and other.matcher == self.matcher
@@ -492,15 +577,13 @@ class LookaheadMatcher(Matcher):
 
 class NotMatcher(Matcher):
 
-    def __init__(self, matcher, action=None):
-        self.action = action
+    def __init__(self, matcher):
         self.matcher = matcher
 
     @memoize
     def match(self, context, at, skip):
-        result = self.matcher.match(context, at, skip)
-        if result is None:
-            return Result(self.action, result, context.text, at, at)
+        result, end = self.matcher.match(context, at, skip)
+        return result is None or None, at
 
     def __eq__(self, other):
         return type(other) == NotMatcher and other.matcher == self.matcher
@@ -517,15 +600,12 @@ class NotMatcher(Matcher):
 
 class VerbatimMatcher(Matcher):
 
-    def __init__(self, matcher, action=None):
-        self.action = action
+    def __init__(self, matcher):
         self.matcher = matcher
 
     @memoize
     def match(self, context, at, skip):
-        result = self.matcher.match(context, at, None)
-        if result:
-            return Result(self.action, result, context.text, at, at)
+        return self.matcher.match(context, at, None)
 
     def __eq__(self, other):
         return type(other) == VerbatimMatcher and other.matcher == self.matcher
@@ -543,81 +623,144 @@ class VerbatimMatcher(Matcher):
 ########################################################################################################################
 
 
+def re_str(result):
+    return re_str_iter(result[0]), result[1]
+
+
+def re_str_iter(result):
+    if result is None or type(result) == bool:
+        return result
+    elif type(result) == tuple:
+        if type(result[1]) == int:
+            return result
+        else:
+            return result[0], re_str_iter(result[1])
+    elif type(result) == list:
+        return list(re_str_iter(item) for item in result)
+    else:
+        return result.start(0), result.group(0)
+
+
 class TestMatchers(unittest.TestCase):
 
     skip = RegexpMatcher(r'\s+')
 
     def test_string_matcher(self):
         matcher = StringMatcher('hello')
-        self.assertIsNotNone(matcher.match(Context(None, "hello"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, " \n\thello"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "Hello"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "hello"), 1, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "hello"), 9, self.skip))
+        self.assertEqual(matcher.match(Context(None, "hello"), 0, self.skip),
+                         (('hello', 0), 5))
+        self.assertEqual(matcher.match(Context(None, " \n\thello"), 0, self.skip),
+                         (('hello', 3), 8))
+        self.assertEqual(matcher.match(Context(None, "Hello"), 0, self.skip),
+                         (None, 0))
+        self.assertEqual(matcher.match(Context(None, "hello"), 1, self.skip),
+                         (None, 1))
+        self.assertEqual(matcher.match(Context(None, "hello"), 9, self.skip),
+                         (None, 9))
 
     def test_regexp_matcher(self):
         matcher = RegexpMatcher(re.compile('hello', re.IGNORECASE))
-        self.assertIsNotNone(matcher.match(Context(None, "hello"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, " \n\thello"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, "Hello"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, "HELLO"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "hell"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "hello"), 1, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "hello"), 9, self.skip))
+        self.assertEqual(re_str(matcher.match(Context(None, "hello"), 0, self.skip)),
+                         ((0, 'hello'), 5))
+        self.assertEqual(re_str(matcher.match(Context(None, " \n\thello"), 0, self.skip)),
+                         ((3, 'hello'), 8))
+        self.assertEqual(re_str(matcher.match(Context(None, "Hello"), 0, self.skip)),
+                         ((0, 'Hello'), 5))
+        self.assertEqual(re_str(matcher.match(Context(None, "HELLO"), 0, self.skip)),
+                         ((0, 'HELLO'), 5))
+        self.assertEqual(matcher.match(Context(None, "hell"), 0, self.skip),
+                         (None, 0))
+        self.assertEqual(matcher.match(Context(None, "hello"), 1, self.skip),
+                         (None, 1))
+        self.assertEqual(matcher.match(Context(None, "hello"), 9, self.skip),
+                         (None, 9))
 
     def test_selection_matcher(self):
         matcher = SelectionMatcher(StringMatcher('hello'), StringMatcher('world'))
-        self.assertIsNotNone(matcher.match(Context(None, "hello"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, "world"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, ""), 0, self.skip))
+        self.assertEqual(matcher.match(Context(None, "hello"), 0, self.skip),
+                         (('hello', 0), 5))
+        self.assertEqual(matcher.match(Context(None, "world"), 0, self.skip),
+                         (('world', 0), 5))
+        self.assertEqual(matcher.match(Context(None, ""), 0, self.skip),
+                         (None, 0))
 
     def test_sequence_matcher(self):
         matcher = SequenceMatcher(StringMatcher('hello'), StringMatcher('world'))
-        self.assertIsNotNone(matcher.match(Context(None, "hello world"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "hello"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "world"), 0, self.skip))
+        self.assertEqual(matcher.match(Context(None, "hello world"), 0, self.skip),
+                         ([('hello', 0), ('world', 6)], 11))
+        self.assertEqual(matcher.match(Context(None, "hello"), 0, self.skip),
+                         (None, 0))
+        self.assertEqual(matcher.match(Context(None, "world"), 0, self.skip),
+                         (None, 0))
 
     def test_repeat_matcher(self):
         matcher = RepeatMatcher(2, 5, StringMatcher('a'))
-        self.assertIsNone(matcher.match(Context(None, ""), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "a"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, "aa"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, "aaa"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, "aaaa"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, "aaaaa"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(None, "aaaaaa"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, "aaaaaaa"), 2, self.skip))
+        self.assertEqual(matcher.match(Context(None, ""), 0, self.skip),
+                         (None, 0))
+        self.assertEqual(matcher.match(Context(None, "a"), 0, self.skip),
+                         (None, 0))
+        self.assertEqual(matcher.match(Context(None, "aa"), 0, self.skip),
+                         ([('a', 0), ('a', 1)], 2))
+        self.assertEqual(matcher.match(Context(None, "aaa"), 0, self.skip),
+                         ([('a', 0), ('a', 1), ('a', 2)], 3))
+        self.assertEqual(matcher.match(Context(None, "aaaa"), 0, self.skip),
+                         ([('a', 0), ('a', 1), ('a', 2), ('a', 3)], 4))
+        self.assertEqual(matcher.match(Context(None, "aaaaa"), 0, self.skip),
+                         ([('a', 0), ('a', 1), ('a', 2), ('a', 3), ('a', 4)], 5))
+        self.assertEqual(matcher.match(Context(None, "aaaaaa"), 0, self.skip),
+                         ([('a', 0), ('a', 1), ('a', 2), ('a', 3), ('a', 4)], 5))
+        self.assertEqual(matcher.match(Context(None, "aaaaaaa"), 3, self.skip),
+                         ([('a', 3), ('a', 4), ('a', 5), ('a', 6)], 7))
 
     def test_reference_matcher(self):
-        matchers = {'word': RegexpMatcher(re.compile(r'\w+'))}
+        matchers = {'word': RegexpMatcher(r'\w+')}
         matcher = ReferenceMatcher('word')
-        self.assertIsNotNone(matcher.match(Context(matchers, "hello"), 0, self.skip))
-        self.assertIsNone(matcher.match(Context(matchers, "..."), 0, self.skip))
-        matchers = {}
-        self.assertIsNone(matcher.match(Context(matchers, "hello"), 0, self.skip))
+        self.assertEqual(re_str(matcher.match(Context(matchers, "hello"), 0, self.skip)),
+                         (('word', (0, 'hello')), 5))
+        self.assertEqual(matcher.match(Context(matchers, "..."), 0, self.skip),
+                         (None, 0))
+        self.assertEqual(matcher.match(Context({}, "hello"), 0, self.skip),
+                         (None, 0))
+
+    def test_named_matcher(self):
+        matcher = NamedMatcher('word', RegexpMatcher(r'\w+'))
+        self.assertEqual(re_str(matcher.match(Context(None, "hello"), 0, self.skip)),
+                         (('word', (0, 'hello')), 5))
+        self.assertEqual(matcher.match(Context(None, "..."), 0, self.skip),
+                         (None, 0))
 
     def test_lookahead_matcher(self):
         matcher = LookaheadMatcher(StringMatcher('hello'))
-        result = matcher.match(Context(None, "hello"), 0, self.skip)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.end, 0)
-        self.assertIsNone(matcher.match(Context(None, "world"), 0, self.skip))
-        extended_matcher = SequenceMatcher(matcher, StringMatcher('hello world'))
-        self.assertIsNotNone(extended_matcher.match(Context(None, "hello world"), 0, self.skip))
-        self.assertIsNone(extended_matcher.match(Context(None, "hello, world"), 0, self.skip))
+        self.assertEqual(matcher.match(Context(None, "hello"), 0, self.skip),
+                         (True, 0))
+        self.assertEqual(matcher.match(Context(None, "world"), 0, self.skip),
+                         (None, 0))
+        extended_matcher = SequenceMatcher(matcher, RegexpMatcher('.*'))
+        self.assertEqual(re_str(extended_matcher.match(Context(None, "hello world"), 0, self.skip)),
+                         ([(0, 'hello world')], 11))
+        self.assertEqual(extended_matcher.match(Context(None, "world hello"), 0, self.skip),
+                         (None, 0))
 
     def test_not_matcher(self):
         matcher = NotMatcher(StringMatcher('world'))
-        result = matcher.match(Context(None, "hello"), 0, self.skip)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.end, 0)
-        self.assertIsNone(matcher.match(Context(None, "world"), 0, self.skip))
+        self.assertEqual(matcher.match(Context(None, "hello"), 0, self.skip),
+                         (True, 0))
+        self.assertEqual(matcher.match(Context(None, "world"), 0, self.skip),
+                         (None, 0))
+        extended_matcher = SequenceMatcher(matcher, RegexpMatcher('.*'))
+        self.assertEqual(re_str(extended_matcher.match(Context(None, "hello world"), 0, self.skip)),
+                         ([(0, 'hello world')], 11))
+        self.assertEqual(extended_matcher.match(Context(None, "world hello"), 0, self.skip),
+                         (None, 0))
 
     def test_verbatim_matcher(self):
         matcher = StringMatcher('hello')
-        self.assertIsNotNone(VerbatimMatcher(matcher).match(Context(None, "hello"), 0, self.skip))
-        self.assertIsNotNone(matcher.match(Context(None, " hello"), 0, self.skip))
-        self.assertIsNone(VerbatimMatcher(matcher).match(Context(None, " hello"), 0, self.skip))
+        self.assertEqual(VerbatimMatcher(matcher).match(Context(None, "hello"), 0, self.skip),
+                         (('hello', 0), 5))
+        self.assertEqual(matcher.match(Context(None, " hello"), 0, self.skip),
+                         (('hello', 1), 6))
+        self.assertEqual(VerbatimMatcher(matcher).match(Context(None, " hello"), 0, self.skip),
+                         (None, 0))
 
 
 class TestGrammarParser(unittest.TestCase):
@@ -637,30 +780,30 @@ class TestGrammarParser(unittest.TestCase):
         self.assertEqual(grammar.parse("[x / x]", goal='word'),
                          RepeatMatcher(0, 1, SelectionMatcher(ReferenceMatcher('x'), ReferenceMatcher('x'))))
         self.assertEqual(grammar.parse("<<x>>", goal='word'),
-                         ReferenceMatcher('x'))
+                         VerbatimMatcher(ReferenceMatcher('x')))
 
     def test_sequence_word_rule(self):
         grammar = GrammarParser()
-        self.assertEqual(grammar.parse("hello", goal='sequence_word'),
-                         ReferenceMatcher('hello'))
-        self.assertEqual(grammar.parse("!hello", goal='sequence_word'),
-                         NotMatcher(ReferenceMatcher('hello')))
-        self.assertEqual(grammar.parse("hello?", goal='sequence_word'),
-                         RepeatMatcher(0, 1, ReferenceMatcher('hello')))
-        self.assertEqual(grammar.parse("hello*", goal='sequence_word'),
-                         RepeatMatcher(0, None, ReferenceMatcher('hello')))
-        self.assertEqual(grammar.parse("hello+", goal='sequence_word'),
-                         RepeatMatcher(1, None, ReferenceMatcher('hello')))
-        self.assertEqual(grammar.parse("hello<3>", goal='sequence_word'),
-                         RepeatMatcher(3, 3, ReferenceMatcher('hello')))
-        self.assertEqual(grammar.parse("hello<,3>", goal='sequence_word'),
-                         RepeatMatcher(0, 3, ReferenceMatcher('hello')))
-        self.assertEqual(grammar.parse("hello<3,>", goal='sequence_word'),
-                         RepeatMatcher(3, None, ReferenceMatcher('hello')))
-        self.assertEqual(grammar.parse("hello<,>", goal='sequence_word'),
-                         RepeatMatcher(0, None, ReferenceMatcher('hello')))
-        self.assertEqual(grammar.parse("hello<5,7>", goal='sequence_word'),
-                         RepeatMatcher(5, 7, ReferenceMatcher('hello')))
+        self.assertEqual(grammar.parse("x", goal='sequence_word'),
+                         ReferenceMatcher('x'))
+        self.assertEqual(grammar.parse("!x", goal='sequence_word'),
+                         NotMatcher(ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("x?", goal='sequence_word'),
+                         RepeatMatcher(0, 1, ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("x*", goal='sequence_word'),
+                         RepeatMatcher(0, None, ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("x+", goal='sequence_word'),
+                         RepeatMatcher(1, None, ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("x<3>", goal='sequence_word'),
+                         RepeatMatcher(3, 3, ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("x<,3>", goal='sequence_word'),
+                         RepeatMatcher(0, 3, ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("x<3,>", goal='sequence_word'),
+                         RepeatMatcher(3, None, ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("x<,>", goal='sequence_word'),
+                         RepeatMatcher(0, None, ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("x<5,7>", goal='sequence_word'),
+                         RepeatMatcher(5, 7, ReferenceMatcher('x')))
         # ...
 
 
@@ -668,12 +811,15 @@ class TestGrammar(unittest.TestCase):
 
     class HelloGrammar(Grammar):
 
-        def statement_rule(self):
-            r"statement = 'hello' r'\s+' 'world'"
+        def statement_rule(self, args):
+            r"statement = {r'\w+'}"
+            return tuple(arg[0] for arg in args)
 
         # ...
 
     def test_simple_grammar(self):
         grammar = self.HelloGrammar()
-        self.assertIsNotNone(grammar.parse("statement", "hello world"))
+        self.assertEqual(grammar.parse("statement", "hello"), ('hello',))
+        self.assertEqual(grammar.parse("statement", "hello world"), ('hello', 'world'))
+        self.assertEqual(grammar.parse("statement", "hello world!"), None)
         # ...
