@@ -5,14 +5,13 @@ import unittest
 
 
 ########################################################################################################################
-import sys
 
 
 def memoize(f):
 
     class Memoizer(dict):
 
-        def __get__(self, obj, objtype):
+        def __get__(self, obj, _):
             return lambda *args: self(obj, *args)
 
         def __call__(self, *args):
@@ -24,21 +23,21 @@ def memoize(f):
     return Memoizer()
 
 
-def trace(f):
+def trace(func):
 
     class Tracer(object):
 
-        def __get__(self, obj, objtype):
+        def __get__(self, obj, _):
             return lambda *args, **kwargs: self(obj, *args, **kwargs)
 
         def __call__(self, *args, **kwargs):
-            a = ', '.join([repr(i) for i in args] + ['%s=%s' % (k, repr(w)) for k,w in kwargs.items()])
+            args_str = ', '.join([repr(i) for i in args] + ['%s=%s' % (k, repr(w)) for k, w in kwargs.items()])
             try:
-                result = f(*args,**kwargs)
-                print("%s(%s): ==> %s" % (f, a, repr(result)))
+                result = func(*args, **kwargs)
+                print("%s(%s): ==> %s" % (func, args_str, repr(result)))
                 return result
             except Exception as e:
-                print("%s(%s): --> %s" % (f, a, repr(e)))
+                print("%s(%s): --> %s" % (func, args_str, repr(e)))
                 raise
 
     return Tracer()
@@ -48,24 +47,25 @@ def trace(f):
 
 
 class Grammar(object):
-    """
+    r"""
 Grammar:
 
 * statement = name '=' rule
 * rule = sequence {'/' sequence}
 * sequence = {sequence_word} ['&' {sequence_word}+]
-* sequence_word =  ['!'] word ['?' / '*' / '+' / '<' [lower] [',' [upper]] '>']
+* sequence_word =  ['!' / name ':'] word ['?' / '*' / '+' / '<' times '>' / '<' [lower] ',' [upper] '>']
 * word = regexp / string / name / '(' rule ')' / '{' rule '}' / '[' rule ']' / '<<' rule '>>
 
 Literals:
 
-* name = r'\w+'
-* string = r"'(?:\\'|[^'])*'"
-* regexp = r"r'(?:\\'|[^'])*'"
+* name = "\w+"
+* string = "'(?:\\'|[^'])*'"
+* regexp = "\"(?:\\\"|[^\"])*""
+* times = lower = upper = "\d"
 
 Skipped:
 
-* r'\s*'
+* "\s*"
 
 Repetition short-cuts:
 
@@ -73,7 +73,8 @@ Repetition short-cuts:
 * word* == word<0,>
 * word+ == word<1,>
 * word<n> == word<n,n>
-* word<n,m> ==
+* word<,n> == word<0,n>
+* word<,> == word<0,>
 
 No skip rules:
 
@@ -84,9 +85,12 @@ No skip rules:
         names = dict()
         grammar_parser = GrammarParser()
         for name, func in self.__class__.__dict__.items():
-            if name.startswith('rule_') or name.endswith('_rule'):
-                name, rule = grammar_parser.parse(func.__doc__)
-                names.setdefault(name, list()).append(rule)
+            if name.endswith('_rule'):
+                rule_name = name[:-5]
+                if isinstance(func, (staticmethod, classmethod)):
+                    func = func.__func__
+                rule = grammar_parser.parse(func.__doc__.strip())
+                names.setdefault(rule_name, list()).append(rule)
         self.rules = dict((name, SelectionMatcher(*rules)) for name, rules in names.items())
 
     def parse(self, goal, text):
@@ -104,14 +108,12 @@ class GrammarParser(object):
 
     def __init__(self):
         self.rules = {
-            'statement':
-                Matcher.seq(r'/\w+/', '=', 'rule'),
             'rule':
                 Matcher.seq('sequence', {('/', 'sequence')}),
             'sequence':
                 Matcher.seq({'sequence_word'}, [('&', {1: 'sequence_word'})]),
             'sequence_word':
-                Matcher.seq(['!'], 'word', ['counting']),
+                Matcher.seq([Matcher.sel('!', (r'/\w+/', ':'))], 'word', ['counting']),
             'word':
                 Matcher.sel('regexp', 'string', 'reference', 'group', 'repeat', 'optional', 'verbatim'),
             'counting':
@@ -119,7 +121,7 @@ class GrammarParser(object):
             'number':
                 Matcher.seq(r'/\d+/'),
             'regexp':
-                Matcher.seq(r"/r'(?:\\'|[^'])*'/"),
+                Matcher.seq(r'/"(?:\\"|[^"])*"/'),
             'string':
                 Matcher.seq(r"/'(?:\\'|[^'])*'/"),
             'reference':
@@ -134,28 +136,26 @@ class GrammarParser(object):
                 Matcher.seq('<<', 'rule', '>>')
         }
 
-    def parse(self, text, goal='statement'):
+    def parse(self, text, goal='rule'):
         result, end = ReferenceMatcher(goal).match(Context(self.rules, text), 0, RegexpMatcher(r'\s*'))
         if result is not None and end == len(text):
             return Matcher.apply(result, self)
         else:
             return None
 
-    def statement_visitor(self, args):
-        name, _, rule = args
-        return name.group(0), rule
-
-    def rule_visitor(self, rule):
+    @staticmethod
+    def rule_visitor(rule):
         selection, selections = rule
         if selections:
             return SelectionMatcher(selection, *list(sequence for _, sequence in selections))
         else:
             return selection
 
-    def sequence_visitor(self, rule):
+    @staticmethod
+    def sequence_visitor(rule):
         sequence, lookahead = rule
         if len(lookahead) == 1:
-           sequence.append(LookaheadMatcher(lookahead[0]))
+            sequence.append(LookaheadMatcher(lookahead[0]))
         elif len(lookahead) > 1:
             sequence.append(LookaheadMatcher(SequenceMatcher(*lookahead)))
         if len(sequence) == 1:
@@ -164,22 +164,29 @@ class GrammarParser(object):
             result = SequenceMatcher(*sequence)
         return result
 
-    def sequence_word_visitor(self, rule):
-        negator, word, counting = rule
+    @staticmethod
+    def sequence_word_visitor(rule):
+        prefix, word, counting = rule
         if counting:
             lower, upper = counting[0]
             word = RepeatMatcher(lower, upper, word)
-        if negator:
-            word = NotMatcher(word)
+        if prefix:
+            name, _ = prefix[0]  # prefix is either [("!", _)] or [[re_result, _]]
+            if name == '!':
+                word = NotMatcher(word)
+            else:
+                word = NamedMatcher(name.group(0), word)
         return word
 
-    def word_visitor(self, word):
+    @staticmethod
+    def word_visitor(word):
         return word
 
-    def counting_visitor(self, arg):
+    @staticmethod
+    def counting_visitor(arg):
         if len(arg) == 2:
             token, _ = arg
-            return {'?': (0, 1), '*': (0, None), '+': (1, None)}[token]
+            return GrammarParser.COUNTING_TOKENS[token]
         elif len(arg) == 3:
             _, times, _ = arg
             return times, times
@@ -187,45 +194,39 @@ class GrammarParser(object):
             _, lower, _, upper, _ = arg
             return (lower[0] if lower else 0), (upper[0] if upper else None)
 
-    def reference_visitor(self, name):
+    COUNTING_TOKENS = {'?': (0, 1), '*': (0, None), '+': (1, None)}
+
+    @staticmethod
+    def reference_visitor(name):
         return ReferenceMatcher(name.group(0))
 
-    def group_visitor(self, rule):
+    @staticmethod
+    def group_visitor(rule):
         return rule[1]
 
-    def repeat_visitor(self, rule):
+    @staticmethod
+    def repeat_visitor(rule):
         return RepeatMatcher(0, None, rule[1])
 
-    def optional_visitor(self, rule):
+    @staticmethod
+    def optional_visitor(rule):
         return RepeatMatcher(0, 1, rule[1])
 
-    def verbatim_visitor(self, rule):
+    @staticmethod
+    def verbatim_visitor(rule):
         return VerbatimMatcher(rule[1])
 
-    def string_visitor(self, value):
+    @staticmethod
+    def string_visitor(value):
         return StringMatcher(ast.literal_eval(value.group(0)))
 
-    def regexp_visitor(self, value):
-        return RegexpMatcher(ast.literal_eval(value.group(0)))
+    @staticmethod
+    def regexp_visitor(value):
+        return RegexpMatcher(value.group(0)[1:-1])
 
-    def number_visitor(self, value):
+    @staticmethod
+    def number_visitor(value):
         return ast.literal_eval(value.group(0))
-
-
-def ref(name):
-    return ReferenceMatcher(name)
-
-
-def opt(*matchers):
-    return RepeatMatcher(0, 1, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers))
-
-
-def rep0(*matchers):
-    return RepeatMatcher(0, None, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers))
-
-
-def rep1(*matchers):
-    return RepeatMatcher(1, None, matchers[0] if len(matchers) == 1 else SequenceMatcher(*matchers))
 
 
 ########################################################################################################################
@@ -264,25 +265,34 @@ class Matcher(object):
         else:
             return SelectionMatcher(*list(cls._create(arg) for arg in args))
 
-
-
     @classmethod
     def apply(cls, match, visitor):
-        if type(match) == list:
+        if isinstance(match, list):
             return list(cls.apply(item, visitor) for item in match)
-        elif type(match) == tuple and not type(match[1]) == int:
+        elif isinstance(match, tuple) and not type(match[1]) == int:
             return cls._visit(visitor, match[0], cls.apply(match[1], visitor))
         else:
             return match
 
+    # ------------------------------------------------------------------------------------------------------------------
+
     @classmethod
     def _visit(cls, visitor, name, args):
+        visitor_class = visitor.__class__
         for suffix in ['_visitor', '_rule']:
             fn_name = name + suffix
-            if fn_name in visitor.__class__.__dict__:
-                return visitor.__class__.__dict__[fn_name](visitor, args)
+            if fn_name in visitor_class.__dict__:
+                func = visitor_class.__dict__[fn_name]
+                if isinstance(func, staticmethod):
+                    # noinspection PyCallingNonCallable
+                    return func.__func__(args)
+                elif isinstance(func, classmethod):
+                    # noinspection PyCallingNonCallable
+                    return func.__func__(visitor_class, args)
+                else:
+                    return func(visitor, args)
         raise Exception("%s.%s do not have a '%s_visitor' or '%s_rule' method defined" %
-                        (visitor.__class__.__module__, visitor.__class__.__name__, name, name))
+                        (visitor_class.__module__, visitor_class.__name__, name, name))
 
     @staticmethod
     def _skip(context, at, skip):
@@ -293,11 +303,9 @@ class Matcher(object):
                 result, end = skip.match(context, at, None)
         return at
 
-    WORD_RE = re.compile(r'^\w+$')
-
     @classmethod
     def _create(cls, arg):
-        if type(arg) == str:
+        if isinstance(arg, str):
             if cls.WORD_RE.match(arg):
                 return ReferenceMatcher(arg)
             elif len(arg) > 2 and arg.startswith('/') and arg.endswith('/'):
@@ -306,24 +314,25 @@ class Matcher(object):
                 return StringMatcher(arg[1:-1])
             else:
                 return StringMatcher(arg)
-        elif type(arg) == tuple:
+        elif isinstance(arg, tuple):
             return cls.seq(*arg)
-        elif type(arg) == list and len(arg) == 1:
+        elif isinstance(arg, list) and len(arg) == 1:
             return RepeatMatcher(0, 1, cls._create(arg[0]))
-        elif type(arg) == set and len(arg) == 1:
+        elif isinstance(arg, set) and len(arg) == 1:
             return RepeatMatcher(0, None, cls._create(arg.pop()))
-        elif type(arg) == dict and len(arg) == 1:
+        elif isinstance(arg, dict) and len(arg) == 1:
             for key, value in arg.items():
-                if type(key) == str:
+                if isinstance(key, str):
                     return NamedMatcher(key, cls._create(value))
-                elif type(key) == int:
+                elif isinstance(key, int):
                     return RepeatMatcher(key, None, cls._create(value))
-                elif type(key) == tuple:
+                elif isinstance(key, tuple):
                     return RepeatMatcher(key[0], key[1], cls._create(value))
         elif isinstance(arg, Matcher):
             return arg
         raise Exception("malformed Matcher.seq or Matcher.sel item: " + repr(arg))
 
+    WORD_RE = re.compile(r'^\w+$')
 
 
 class ReferenceMatcher(Matcher):
@@ -340,7 +349,7 @@ class ReferenceMatcher(Matcher):
         return None, at
 
     def __eq__(self, other):
-        return type(other) == ReferenceMatcher and other.name == self.name
+        return isinstance(other, ReferenceMatcher) and other.name == self.name
 
     def __hash__(self):
         return hash(self.name)
@@ -366,7 +375,7 @@ class NamedMatcher(Matcher):
         return None, at
 
     def __eq__(self, other):
-        return type(other) == NamedMatcher and other.name == self.name and other.rule == self.rule
+        return isinstance(other, NamedMatcher) and other.name == self.name and other.rule == self.rule
 
     def __hash__(self):
         return hash((self.name, self.rule))
@@ -392,7 +401,7 @@ class StringMatcher(Matcher):
         return None, at
 
     def __eq__(self, other):
-        return type(other) == StringMatcher and other.word == self.word
+        return isinstance(other, StringMatcher) and other.word == self.word
 
     def __hash__(self):
         return hash(self.word)
@@ -407,7 +416,9 @@ class StringMatcher(Matcher):
 class RegexpMatcher(Matcher):
 
     def __init__(self, regexp):
-        self.regexp = regexp if type(regexp) == type(re.compile('')) else re.compile(str(regexp))
+        self.regexp = regexp if isinstance(regexp, self.REGEXP_TYPE) else re.compile(str(regexp))
+
+    REGEXP_TYPE = type(re.compile(''))
 
     @memoize
     def match(self, context, at, skip):
@@ -418,7 +429,7 @@ class RegexpMatcher(Matcher):
         return None, at
 
     def __eq__(self, other):
-        return type(other) == RegexpMatcher and other.regexp == self.regexp
+        return isinstance(other, RegexpMatcher) and other.regexp == self.regexp
 
     def __hash__(self):
         return hash(self.regexp)
@@ -444,7 +455,7 @@ class SelectionMatcher(Matcher):
         return None, at
 
     def __eq__(self, other):
-        return type(other) == SelectionMatcher and other.matchers == self.matchers
+        return isinstance(other, SelectionMatcher) and other.matchers == self.matchers
 
     def __hash__(self):
         return hash(self.matchers)
@@ -474,7 +485,7 @@ class SequenceMatcher(Matcher):
         return sequence, end
 
     def __eq__(self, other):
-        return type(other) == SequenceMatcher and other.matchers == self.matchers
+        return isinstance(other, SequenceMatcher) and other.matchers == self.matchers
 
     def __hash__(self):
         return hash(self.matchers)
@@ -507,7 +518,8 @@ class RepeatMatcher(Matcher):
         return sequence, end
 
     def __eq__(self, other):
-        return type(other) == RepeatMatcher and other.lower == self.lower and other.upper == self.upper and other.matcher == self.matcher
+        return (isinstance(other, RepeatMatcher) and other.lower == self.lower and
+                other.upper == self.upper and other.matcher == self.matcher)
 
     def __hash__(self):
         return hash((self.lower, self.upper, self.matcher))
@@ -539,7 +551,7 @@ class LookaheadMatcher(Matcher):
         return result is not None or None, at
 
     def __eq__(self, other):
-        return type(other) == LookaheadMatcher and other.matcher == self.matcher
+        return isinstance(other, LookaheadMatcher) and other.matcher == self.matcher
 
     def __hash__(self):
         return hash(self.matcher)
@@ -562,7 +574,7 @@ class NotMatcher(Matcher):
         return result is None or None, at
 
     def __eq__(self, other):
-        return type(other) == NotMatcher and other.matcher == self.matcher
+        return isinstance(other, NotMatcher) and other.matcher == self.matcher
 
     def __hash__(self):
         return hash(self.matcher)
@@ -584,7 +596,7 @@ class VerbatimMatcher(Matcher):
         return self.matcher.match(context, at, None)
 
     def __eq__(self, other):
-        return type(other) == VerbatimMatcher and other.matcher == self.matcher
+        return isinstance(other, VerbatimMatcher) and other.matcher == self.matcher
 
     def __hash__(self):
         return hash(self.matcher)
@@ -604,14 +616,14 @@ def re_str(result):
 
 
 def re_str_iter(result):
-    if result is None or type(result) == bool:
+    if result is None or isinstance(result, bool):
         return result
-    elif type(result) == tuple:
+    elif isinstance(result, tuple):
         if type(result[1]) == int:
             return result
         else:
             return result[0], re_str_iter(result[1])
-    elif type(result) == list:
+    elif isinstance(result, list):
         return list(re_str_iter(item) for item in result)
     else:
         return result.start(0), result.group(0)
@@ -747,7 +759,7 @@ class TestGrammarParser(unittest.TestCase):
                          ReferenceMatcher('hello'))
         self.assertEqual(grammar.parse("'hello world'", goal='word'),
                          StringMatcher('hello world'))
-        self.assertEqual(grammar.parse("r'hello\s+world'", goal='word'),
+        self.assertEqual(grammar.parse(r'"hello\s+world"', goal='word'),
                          RegexpMatcher(r'hello\s+world'))
         self.assertEqual(grammar.parse("(x)", goal='word'),
                          ReferenceMatcher('x'))
@@ -764,6 +776,8 @@ class TestGrammarParser(unittest.TestCase):
                          ReferenceMatcher('x'))
         self.assertEqual(grammar.parse("!x", goal='sequence_word'),
                          NotMatcher(ReferenceMatcher('x')))
+        self.assertEqual(grammar.parse("n:x", goal='sequence_word'),
+                         NamedMatcher('n', ReferenceMatcher('x')))
         self.assertEqual(grammar.parse("x?", goal='sequence_word'),
                          RepeatMatcher(0, 1, ReferenceMatcher('x')))
         self.assertEqual(grammar.parse("x*", goal='sequence_word'),
@@ -787,8 +801,11 @@ class TestGrammar(unittest.TestCase):
 
     class HelloGrammar(Grammar):
 
-        def statement_rule(self, args):
-            r"statement = {r'\w+'}"
+        @classmethod  # use @classmethod instead of @staticmethod to verify that both can be used (see GrammarParser)
+        def statement_rule(cls, args):
+            r"""
+            {"\w+"}
+            """
             return tuple(arg[0] for arg in args)
 
         # ...
