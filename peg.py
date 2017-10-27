@@ -248,6 +248,7 @@ class Context(object):
         self.failed_frozen = False
         self.failed_at = -1
         self.failed_when_expected = None
+        self.failed_stack = None
 
     def __repr__(self):
         return "Context(%s)" % repr(self.text)
@@ -871,7 +872,8 @@ class TestGrammar(unittest.TestCase):
                     sum -= term
             return sum
 
-        def term_rule(self, args):
+        @staticmethod
+        def term_rule(args):
             """
             factor {('*' / '//' / '/' / '%') factor}
             """
@@ -887,7 +889,8 @@ class TestGrammar(unittest.TestCase):
                     prod %= factor
             return prod
 
-        def factor_rule(self, args):
+        @staticmethod
+        def factor_rule(args):
             """
             number / '(' expression ')'
             """
@@ -896,7 +899,8 @@ class TestGrammar(unittest.TestCase):
             else:
                 return args
 
-        def number_rule(self, args):
+        @staticmethod
+        def number_rule(args):
             r"""
             "[+-]?\d+(?:.\d+)?(?:[Ee][+-]?\d+)?"
             """
