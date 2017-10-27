@@ -86,13 +86,11 @@ No skip rules:
         self.rules = dict()
         grammar_parser = GrammarParser()
         for name, func in self.__class__.__dict__.items():
-            rules = []
             if name.endswith('_rule'):
                 rule_name = name[:-5]
                 if isinstance(func, (staticmethod, classmethod)):
                     func = func.__func__
-                rules.append(grammar_parser.parse(func.__doc__.strip()))
-                self.rules[rule_name] = rules[0] if len(rules) == 1 else SelectionMatcher(*rules)
+                self.rules[rule_name] = grammar_parser.parse(func.__doc__.strip())
 
     def parse(self, goal, text):
         context = Context(self.rules, text)
@@ -858,20 +856,63 @@ class TestGrammarParser(unittest.TestCase):
 
 class TestGrammar(unittest.TestCase):
 
-    class HelloGrammar(Grammar):
+    class CalculatorGrammar(Grammar):
 
         @classmethod  # use @classmethod instead of @staticmethod to verify that both can be used (see GrammarParser)
-        def statement_rule(cls, args):
-            r"""
-            {"\w+"}
+        def expression_rule(cls, args):
             """
-            return tuple(arg[0] for arg in args)
+            term {('+' / '-') term}
+            """
+            sum = args[0]
+            for (op, _), term in args[1]:
+                if op == '+':
+                    sum += term
+                else:
+                    sum -= term
+            return sum
 
-        # ...
+        def term_rule(self, args):
+            """
+            factor {('*' / '//' / '/' / '%') factor}
+            """
+            prod = args[0]
+            for (op, _), factor in args[1]:
+                if op == '*':
+                    prod *= factor
+                elif op == '/':
+                    prod /= factor
+                elif op == '//':
+                    prod = int(prod / factor)
+                else:
+                    prod %= factor
+            return prod
+
+        def factor_rule(self, args):
+            """
+            number / '(' expression ')'
+            """
+            if isinstance(args, list):
+                return args[1]
+            else:
+                return args
+
+        def number_rule(self, args):
+            r"""
+            "[+-]?\d+(?:.\d+)?(?:[Ee][+-]?\d+)?"
+            """
+            return ast.literal_eval(args[0])
 
     def test_simple_grammar(self):
-        grammar = self.HelloGrammar()
-        self.assertEqual(grammar.parse("statement", "hello"), ('hello',))
-        self.assertEqual(grammar.parse("statement", "hello world"), ('hello', 'world'))
-        self.assertEqual(grammar.parse("statement", "hello world!"), None)
-        # ...
+        grammar = self.CalculatorGrammar()
+        self.assertAlmostEqual(grammar.parse("expression", "1"), 1, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "-1"), -1, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "1.23"), 1.23, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "1e-3"), 0.001, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "1.23e2"), 123, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "1+2"), 3, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "(1+2) * 7"), 21, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "17 // 3"), 5, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "17 % 3"), 2, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "18 // 3"), 6, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "18 % 3"), 0, 6)
+        self.assertAlmostEqual(grammar.parse("expression", "9 / 4"), 2.25, 6)
