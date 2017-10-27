@@ -1,5 +1,6 @@
 import abc
 import ast
+import inspect
 import re
 import unittest
 
@@ -82,22 +83,29 @@ No skip rules:
 """
 
     def __init__(self):
-        names = dict()
+        self.rules = dict()
         grammar_parser = GrammarParser()
         for name, func in self.__class__.__dict__.items():
+            rules = []
             if name.endswith('_rule'):
                 rule_name = name[:-5]
                 if isinstance(func, (staticmethod, classmethod)):
                     func = func.__func__
-                rule = grammar_parser.parse(func.__doc__.strip())
-                names.setdefault(rule_name, list()).append(rule)
-        self.rules = dict((name, SelectionMatcher(*rules)) for name, rules in names.items())
+                rules.append(grammar_parser.parse(func.__doc__.strip()))
+                self.rules[rule_name] = rules[0] if len(rules) == 1 else SelectionMatcher(*rules)
 
     def parse(self, goal, text):
-        result, end = ReferenceMatcher(goal).match(Context(self.rules, text), 0, RegexpMatcher(r'\s*'))
+        context = Context(self.rules, text)
+        result, end = ReferenceMatcher(goal).match(context, 0, RegexpMatcher(r'\s*'))
         if result is not None and end == len(text):
             return Matcher.apply(result, self)
         else:
+            for frame_info in context.failed_stack:
+                frame_locals = inspect.getargvalues(frame_info.frame).locals
+                frame_object = frame_locals.get('self')
+                if isinstance(frame_object, Matcher):
+                    at = frame_locals.get('at')
+                    print("%6d: %s\n   ---> %s" % (at, repr(text[at:context.failed_at + 12]), repr(frame_object)))
             return None
 
 
@@ -153,11 +161,13 @@ class GrammarParser(object):
 
     @staticmethod
     def sequence_visitor(rule):
-        sequence, lookahead = rule
-        if len(lookahead) == 1:
-            sequence.append(LookaheadMatcher(lookahead[0]))
-        elif len(lookahead) > 1:
-            sequence.append(LookaheadMatcher(SequenceMatcher(*lookahead)))
+        sequence, lookahead_opt = rule
+        if lookahead_opt:
+            _, lookahead = lookahead_opt[0]
+            if len(lookahead) == 1:
+                sequence.append(LookaheadMatcher(lookahead[0]))
+            else:
+                sequence.append(LookaheadMatcher(SequenceMatcher(*lookahead)))
         if len(sequence) == 1:
             result = sequence[0]
         else:
@@ -237,6 +247,9 @@ class Context(object):
     def __init__(self, rules, text):
         self.rules = rules
         self.text = text
+        self.failed_frozen = False
+        self.failed_at = -1
+        self.failed_when_expected = None
 
     def __repr__(self):
         return "Context(%s)" % repr(self.text)
@@ -296,11 +309,13 @@ class Matcher(object):
 
     @staticmethod
     def _skip(context, at, skip):
+        context.failed_frozen = True
         if skip:
             result, end = skip.match(context, at, None)
             while result and end > at:
                 at = end
                 result, end = skip.match(context, at, None)
+        context.failed_frozen = False
         return at
 
     @classmethod
@@ -398,6 +413,10 @@ class StringMatcher(Matcher):
         at = self._skip(context, at, skip)
         if context.text.startswith(self.word, at):
             return (self.word, at), at + self.length
+        if not context.failed_frozen and context.failed_at < at:
+            context.failed_at = at
+            context.failed_when_expected = self.word
+            context.failed_stack = inspect.stack()
         return None, at
 
     def __eq__(self, other):
@@ -426,6 +445,10 @@ class RegexpMatcher(Matcher):
         match = self.regexp.match(context.text, at)
         if match:
             return match, match.end(0)
+        if not context.failed_frozen and context.failed_at < at:
+            context.failed_at = at
+            context.failed_when_expected = self.regexp
+            context.failed_stack = inspect.stack()
         return None, at
 
     def __eq__(self, other):
@@ -747,8 +770,11 @@ class TestMatchers(unittest.TestCase):
                          (('hello', 0), 5))
         self.assertEqual(matcher.match(Context(None, " hello"), 0, self.skip),
                          (('hello', 1), 6))
-        self.assertEqual(VerbatimMatcher(matcher).match(Context(None, " hello"), 0, self.skip),
+        context = Context(None, " hello")
+        self.assertEqual(VerbatimMatcher(matcher).match(context, 0, self.skip),
                          (None, 0))
+        self.assertEqual(context.failed_at, 0)
+        self.assertEqual(context.failed_when_expected, 'hello')
 
 
 class TestGrammarParser(unittest.TestCase):
@@ -794,7 +820,40 @@ class TestGrammarParser(unittest.TestCase):
                          RepeatMatcher(0, None, ReferenceMatcher('x')))
         self.assertEqual(grammar.parse("x<5,7>", goal='sequence_word'),
                          RepeatMatcher(5, 7, ReferenceMatcher('x')))
-        # ...
+
+    def test_sequence_rule(self):
+        grammar = GrammarParser()
+        self.assertEqual(grammar.parse("", goal='sequence'),
+                         SequenceMatcher())
+        self.assertEqual(grammar.parse("x", goal='sequence'),
+                         ReferenceMatcher('x'))
+        self.assertEqual(grammar.parse("x y", goal='sequence'),
+                         SequenceMatcher(ReferenceMatcher('x'), ReferenceMatcher('y')))
+        self.assertEqual(grammar.parse("x y z", goal='sequence'),
+                         SequenceMatcher(ReferenceMatcher('x'), ReferenceMatcher('y'), ReferenceMatcher('z')))
+        self.assertEqual(grammar.parse("x y z &", goal='sequence'),
+                         None)
+        self.assertEqual(grammar.parse("x y & z", goal='sequence'),
+                         SequenceMatcher(ReferenceMatcher('x'), ReferenceMatcher('y'),
+                                         LookaheadMatcher(ReferenceMatcher('z'))))
+        self.assertEqual(grammar.parse("x & y z", goal='sequence'),
+                         SequenceMatcher(ReferenceMatcher('x'),
+                                         LookaheadMatcher(SequenceMatcher(ReferenceMatcher('y'),
+                                                                          ReferenceMatcher('z')))))
+        self.assertEqual(grammar.parse("& x y z", goal='sequence'),
+                         LookaheadMatcher(SequenceMatcher(ReferenceMatcher('x'), ReferenceMatcher('y'),
+                                                          ReferenceMatcher('z'))))
+
+    def test_selection_rule(self):
+        grammar = GrammarParser()
+        self.assertEqual(grammar.parse("", goal='rule'),
+                         SequenceMatcher())
+        self.assertEqual(grammar.parse("x", goal='rule'),
+                         ReferenceMatcher('x'))
+        self.assertEqual(grammar.parse("x / y", goal='rule'),
+                         SelectionMatcher(ReferenceMatcher('x'), ReferenceMatcher('y')))
+        self.assertEqual(grammar.parse("x / y / z", goal='rule'),
+                         SelectionMatcher(ReferenceMatcher('x'), ReferenceMatcher('y'), ReferenceMatcher('z')))
 
 
 class TestGrammar(unittest.TestCase):
