@@ -1,6 +1,5 @@
 import abc
 import ast
-import inspect
 import re
 import unittest
 
@@ -98,13 +97,49 @@ No skip rules:
         if result is not None and end == len(text):
             return Matcher.apply(result, self)
         else:
-            for frame_info in context.failed_stack:
-                frame_locals = inspect.getargvalues(frame_info.frame).locals
-                frame_object = frame_locals.get('self')
-                if isinstance(frame_object, Matcher):
-                    at = frame_locals.get('at')
-                    print("%6d: %s\n   ---> %s" % (at, repr(text[at:context.failed_at + 12]), repr(frame_object)))
-            return None
+            raise ParseError(context.text, context.errors_at, context.errors)
+
+
+########################################################################################################################
+
+
+class ParseError(Exception):
+
+    def __init__(self, text, at, errors):
+        self.text = text
+        self.at = at
+        self.errors = errors
+
+    def verbose(self, filename):
+        lines = []
+        line_no = self.text.count('\n', 0, self.at) + 1
+        lpos = self.text.rfind('\n', 0, self.at)
+        rpos = self.text.find('\n', self.at)
+        column_no = self.at - lpos
+        if len(self.errors) == 1:
+            lines.append("%s:%d:%d: error: expected %s" % (filename, line_no, column_no, self.errors[0]))
+        else:
+            lines.append("%s:%d:%d: error: expected %s or %s" %
+                         (filename, line_no, column_no, ', '.join(str(e) for e in self.errors[:-1]), self.errors[-1]))
+        lines.append(self._make_printable(self.text[lpos + 1:] if rpos < 0 else self.text[lpos + 1:rpos]))
+        lines.append(' ' * len(self._make_printable(self.text[lpos + 1:self.at])) + '^')
+        return '\n'.join(lines)
+
+    def __str__(self):
+        return "%d: parse error: expected %s" % (self.at, ', '.join(str(e) for e in self.errors))
+
+    def __repr__(self):
+        return "ParseError(%s ..., %d, %s" % (repr(self.text[:20]), self.at, self.errors)
+
+    # ------------------------------------------------------------------------------------------------------------------
+
+    def _make_printable(self, text):
+        text = self.TAB_RE.sub(lambda m: ' ' * (4 - m.start(0) % 4), text)
+        text = self.ANY_RE.sub(lambda m: m.group(0) if len(repr(m.group(0))) == 3 else repr(m.group(0))[1:-1], text)
+        return text
+
+    ANY_RE = re.compile('.')
+    TAB_RE = re.compile('\t')
 
 
 ########################################################################################################################
@@ -245,10 +280,17 @@ class Context(object):
     def __init__(self, rules, text):
         self.rules = rules
         self.text = text
-        self.failed_frozen = False
-        self.failed_at = -1
-        self.failed_when_expected = None
-        self.failed_stack = None
+        self.errors_disables = False
+        self.errors_at = -1
+        self.errors = []
+
+    def error(self, matcher, at):
+        if not self.errors_disables and self.errors_at <= at:
+            if self.errors_at  < at:
+                self.errors_at = at
+                self.errors.clear()
+            self.errors.append(matcher)
+        return None, at
 
     def __repr__(self):
         return "Context(%s)" % repr(self.text)
@@ -308,13 +350,13 @@ class Matcher(object):
 
     @staticmethod
     def _skip(context, at, skip):
-        context.failed_frozen = True
+        context.errors_disables = True
         if skip:
             result, end = skip.match(context, at, None)
             while result and end > at:
                 at = end
                 result, end = skip.match(context, at, None)
-        context.failed_frozen = False
+        context.errors_disables = False
         return at
 
     @classmethod
@@ -412,11 +454,7 @@ class StringMatcher(Matcher):
         at = self._skip(context, at, skip)
         if context.text.startswith(self.word, at):
             return (self.word, at), at + self.length
-        if not context.failed_frozen and context.failed_at < at:
-            context.failed_at = at
-            context.failed_when_expected = self.word
-            context.failed_stack = inspect.stack()
-        return None, at
+        return context.error(self, at)
 
     def __eq__(self, other):
         return isinstance(other, StringMatcher) and other.word == self.word
@@ -425,7 +463,7 @@ class StringMatcher(Matcher):
         return hash(self.word)
 
     def __str__(self):
-        return repr(self.word)
+        return repr("'%s'" % self.word)[1:-1]
 
     def __repr__(self):
         return "StringMatcher(%s)" % repr(self.word)
@@ -444,11 +482,7 @@ class RegexpMatcher(Matcher):
         match = self.regexp.match(context.text, at)
         if match:
             return match, match.end(0)
-        if not context.failed_frozen and context.failed_at < at:
-            context.failed_at = at
-            context.failed_when_expected = self.regexp
-            context.failed_stack = inspect.stack()
-        return None, at
+        return context.error(self, at)
 
     def __eq__(self, other):
         return isinstance(other, RegexpMatcher) and other.regexp == self.regexp
@@ -457,7 +491,7 @@ class RegexpMatcher(Matcher):
         return hash(self.regexp)
 
     def __str__(self):
-        return 'r' + repr(self.regexp.pattern)
+        return repr('"%s"' % self.regexp.pattern)[1:-1]
 
     def __repr__(self):
         return "RegexpMatcher(%s)" % repr(self.regexp.pattern)
@@ -772,8 +806,9 @@ class TestMatchers(unittest.TestCase):
         context = Context(None, " hello")
         self.assertEqual(VerbatimMatcher(matcher).match(context, 0, self.skip),
                          (None, 0))
-        self.assertEqual(context.failed_at, 0)
-        self.assertEqual(context.failed_when_expected, 'hello')
+        self.assertEqual(context.errors_at, 0)
+        self.assertEqual(len(context.errors), 1)
+        self.assertEqual(context.errors[0].word, 'hello')
 
 
 class TestGrammarParser(unittest.TestCase):
@@ -855,6 +890,13 @@ class TestGrammarParser(unittest.TestCase):
                          SelectionMatcher(ReferenceMatcher('x'), ReferenceMatcher('y'), ReferenceMatcher('z')))
 
 
+def error(fn):
+    try:
+        fn()
+    except ParseError as e:
+        return e
+
+
 class TestGrammar(unittest.TestCase):
 
     class CalculatorGrammar(Grammar):
@@ -920,3 +962,14 @@ class TestGrammar(unittest.TestCase):
         self.assertAlmostEqual(grammar.parse("expression", "18 // 3"), 6, 6)
         self.assertAlmostEqual(grammar.parse("expression", "18 % 3"), 0, 6)
         self.assertAlmostEqual(grammar.parse("expression", "9 / 4"), 2.25, 6)
+        self.assertEqual(str(error(lambda: grammar.parse("expression", "9 / (4+"))),
+                         r"""7: parse error: expected "[+-]?\\d+(?:.\\d+)?(?:[Ee][+-]?\\d+)?", '('""")
+        self.assertEqual(str(error(lambda: grammar.parse("expression", "9 / (4+1"))),
+                         r"""8: parse error: expected '*', '//', '/', '%', '+', '-', ')'""")
+        self.assertEqual(str(error(lambda: grammar.parse("expression", "9 / 4)"))),
+                         r"""5: parse error: expected '*', '//', '/', '%', '+', '-'""")
+        result = error(lambda: grammar.parse("expression", "9 /\n\t(4+) *\r 7\\")).verbose("/simple/expression.calc").splitlines()
+        expect = [r"""/simple/expression.calc:2:5: error: expected "[+-]?\\d+(?:.\d+)?(?:[Ee][+-]?\\d+)?" or '('""",
+                  r"""    (4+) *\r 7\\""",
+                  r"""       ^"""]
+        self.assertEqual(result, expect)
